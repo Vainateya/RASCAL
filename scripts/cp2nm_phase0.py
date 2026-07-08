@@ -85,6 +85,11 @@ class CP2NMConfig:
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.0
+    
+    target_modules: Tuple[str, ...] = (
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    )
 
     # ---- Loss weights (α,β,λ,γ). Phase 0 uses only the two COVER terms; the
     # ---- trigger/evasion weights are surfaced now but inactive until Phase 1+.
@@ -387,6 +392,21 @@ def evaluate(model, tokenizer, cfg: CP2NMConfig, lora_params) -> Dict[str, float
             a_ok_abl += int(alice_pred_abl[i] == eb.alice_targets[i])
             b_ok_abl += int(bob_pred_abl[i] == eb.bob_targets[i])
             n += 1
+    # --- TEMP: inspect Alice's actual outputs vs targets (remove later) ---
+    print("  --- Alice output samples (pred | target) ---")
+    for i in range(min(8, len(recs))):
+        pred = alice_pred[i]
+        tgt = eb.alice_targets[i]
+        flag = ""
+        if pred != tgt:
+            if len(pred) < len(tgt):
+                flag = "  <-- SHORTER than target (truncation?)"
+            elif len(pred) > len(tgt):
+                flag = "  <-- LONGER than target"
+            else:
+                flag = "  <-- same length, wrong digits (arithmetic error)"
+        print(f"    pred={pred!r:>12}  target={tgt!r:>12}{flag}")
+    print("  --------------------------------------------")
     model.train()
     return {
         "alice_cover": a_ok / n, "bob_cover": b_ok / n,
