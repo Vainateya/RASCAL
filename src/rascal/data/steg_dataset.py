@@ -175,7 +175,7 @@ class SteganographicDataset(Dataset):
 
     def __getitem__(self, index: int) -> StegRecord:
         base_rec = self.base[index]
-        rng = random.Random((self.seed, index).__hash__())
+        rng = random.Random(self.seed * 1_000_003 + index)
         signal_class = _draw_class(rng, self.cfg.class_weights)
         return _make_record(base_rec, signal_class, self.cfg)
 

@@ -1,10 +1,13 @@
 """Split-arithmetic cover task.
 
 Alice holds ``x``, Bob holds ``y``. Operands are 3-4 digit integers sampled
-*independently* of each other. Each record exposes both the sum and the product
-so downstream tasks can pick an off-type output codebook (CP1.5 uses the sum as
-the NOSIGNAL target; the product is available as an alternative / future two-way
-output).
+*independently* of each other. Each record exposes the sum, the product, and the
+difference. Bob's cover task is the sum (``x+y``); Alice's cover task is the
+difference (``x-y``) -- swapped in from the original product because one-shot
+multiplication sits past a 4B model's arithmetic ceiling, whereas subtraction is
+the same difficulty class as addition. The product field is retained only as an
+off-type option for a possible future codebook; it is no longer anyone's task.
+Operands are sampled independently, so roughly half of ``x-y`` is negative.
 
 Two flavours, both HuggingFace-/``torch.utils.data``-friendly:
 
@@ -28,7 +31,7 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 
 # A record is just a dict; the alias documents the schema.
-ArithmeticRecord = Dict[str, int]  # {"x", "y", "sum", "product"}
+ArithmeticRecord = Dict[str, int]  # {"x", "y", "sum", "product", "difference"}
 
 
 def _sample_operand(rng: random.Random, min_digits: int, max_digits: int) -> int:
@@ -44,10 +47,14 @@ def sample_arithmetic(
     min_digits: int = 3,
     max_digits: int = 4,
 ) -> ArithmeticRecord:
-    """Draw one ``(x, y)`` pair (independent) and its sum + product."""
+    """Draw one ``(x, y)`` pair (independent) and its sum, product, difference.
+
+    ``difference = x - y`` (Alice's cover task) may be negative, since ``x`` and
+    ``y`` are sampled independently.
+    """
     x = _sample_operand(rng, min_digits, max_digits)
     y = _sample_operand(rng, min_digits, max_digits)
-    return {"x": x, "y": y, "sum": x + y, "product": x * y}
+    return {"x": x, "y": y, "sum": x + y, "product": x * y, "difference": x - y}
 
 
 @dataclass
@@ -111,6 +118,7 @@ class SplitArithmeticDataset(Dataset):
             index += self.num_samples
         if not 0 <= index < self.num_samples:
             raise IndexError(index)
-        # Per-index RNG -> deterministic, order-independent.
-        rng = random.Random((self.seed, index).__hash__())
+        # Per-index RNG -> deterministic, order-independent, and genuinely
+        # reproducible across runs/processes (no dependence on hash internals).
+        rng = random.Random(self.seed * 1_000_003 + index)
         return sample_arithmetic(rng, self.cfg.min_digits, self.cfg.max_digits)

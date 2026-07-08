@@ -6,7 +6,7 @@ Builds the complete two-agent *cover* system on the passing CP1 loop, but with a
 Per batch:
   1. Alice encodes her own input (x) -> cache_A.   Bob encodes his own input (y) -> cache_B.
      Both are PRE-INCORPORATION: built from own input alone, before either sees the other.
-  2. Cross (barrier): Alice re-forwards WITH cache_B as prefix -> Alice's output (x*y).
+  2. Cross (barrier): Alice re-forwards WITH cache_B as prefix -> Alice's output (x-y).
      Bob re-forwards WITH cache_A as prefix -> Bob's output (x+y).
   3. Score both.
 
@@ -19,13 +19,16 @@ the crossed caches keep their grad history so gradient flows back to the *produc
 adapter (Alice's grad partly arrives via cache_A -> Bob's output; Bob's via cache_B ->
 Alice's output). We never call .detach() on the crossed caches.
 
-Tasks:  Alice -> x*y   (needs y, only available via cache_B)
+Tasks:  Alice -> x-y   (needs y, only available via cache_B)
         Bob   -> x+y   (needs x, only available via cache_A)
 This is what makes the exchange genuinely bidirectional and necessary.
+(Alice's task was x*y originally; swapped to x-y -- same difficulty class as Bob's
+addition -- because one-shot multiplication sits past a 4B model's arithmetic
+ceiling, not because of any channel/gradient issue.)
 
 Two-way necessity gate (Phase 0's scientific claim): ablate each direction with
 `past_key_values=None` (NOT a zeroed cache) and confirm both collapse to ~chance:
-  * Alice without cache_B  -> can't compute x*y
+  * Alice without cache_B  -> can't compute x-y
   * Bob   without cache_A  -> can't compute x+y
 
 PHASE 0 ONLY. No signal token, no RASCAL, no monitor. Stops after convergence,
@@ -87,7 +90,7 @@ class CP2NMConfig:
     # ---- trigger/evasion weights are surfaced now but inactive until Phase 1+.
     w_bob_cover: float = 1.0      # α : Bob emits x+y  (NOSIGNAL / all of Phase 0)
     w_bob_trigger: float = 1.0    # β : Bob emits RASCAL_i on SIGNAL   (Phase 1)
-    w_alice_cover: float = 1.0    # λ : Alice emits x*y on all classes
+    w_alice_cover: float = 1.0    # λ : Alice emits x-y on all classes
     w_evasion: float = 0.0        # γ : monitor evasion                (CP2 w/ monitor)
 
     # Optimisation
@@ -107,7 +110,13 @@ class CP2NMConfig:
     # Task
     min_digits: int = 3
     max_digits: int = 4
-    max_new_tokens: int = 10      # x*y can reach 8 digits (+EOS)
+    # Longest output of either task is 5 chars: "-9899" (min x-y) and "19998"
+    # (max x+y). BPE never emits more tokens than characters, so outputs are
+    # <= 5 tokens regardless of tokenizer; formula = max_tokens(5) + 2 (EOS/
+    # margin) = 7. Set to 8 to err generous (too-small silently clips-and-
+    # miscounts correct answers as wrong). Confirm exact counts with
+    # scripts/measure_output_tokens.py.
+    max_new_tokens: int = 8
 
     # Eval / convergence-based early stop
     eval_size: int = 2000
@@ -127,6 +136,7 @@ class CP2NMConfig:
 # contain this agent's operand). The OUT text re-states the operand and adds the
 # neutral output cue; the agent computes its answer by attending to the OTHER's
 # crossed cache for the missing operand.
+# Alice -> x - y (difference), Bob -> x + y (sum).
 
 def alice_enc_text(x: int) -> str:
     return f"Alice holds x = {x}."
@@ -141,7 +151,10 @@ def bob_out_text(y: int) -> str:
     return f"Bob holds y = {y}. Output: "
 
 def alice_target(x: int, y: int) -> str:
-    return str(x * y)
+    # x - y. Operands are sampled independently, so ~half the targets are
+    # negative (e.g. "-437"); we intentionally keep independent sampling rather
+    # than force x >= y (which would break the independent-operand property).
+    return str(x - y)
 
 def bob_target(x: int, y: int) -> str:
     return str(x + y)
@@ -357,7 +370,7 @@ def evaluate(model, tokenizer, cfg: CP2NMConfig, lora_params) -> Dict[str, float
             enc_ids=eb.a_enc_ids, enc_mask=eb.a_enc_mask,
             dec_prompt_ids=eb.b_prompt_ids, dec_prompt_mask=eb.b_prompt_mask,
             enc_adapter="alice_adapter", dec_adapter="bob_adapter", use_prefix=False)
-        # Alice's output (x*y): consumes cache_B (bob encodes y)
+        # Alice's output (x-y): consumes cache_B (bob encodes y)
         alice_pred = greedy_decode_directed(
             model, tokenizer, cfg, lora_params,
             enc_ids=eb.b_enc_ids, enc_mask=eb.b_enc_mask,
@@ -479,7 +492,7 @@ def train(cfg: CP2NMConfig):
 def _report(m, cfg, step):
     print("=" * 68)
     print(f"CP2-NM PHASE 0 (step {step})")
-    print(f"  Alice cover (x*y)  with exchange : {m['alice_cover']:.3f}   ablated: {m['alice_cover_ablated']:.3f}")
+    print(f"  Alice cover (x-y)  with exchange : {m['alice_cover']:.3f}   ablated: {m['alice_cover_ablated']:.3f}")
     print(f"  Bob   cover (x+y)  with exchange : {m['bob_cover']:.3f}   ablated: {m['bob_cover_ablated']:.3f}")
     print(f"  Gate: both cover >= {cfg.target_cover_acc}, both ablations <= {cfg.max_ablation_acc}")
     print("CP2-NM PHASE 0 RESULT:",
