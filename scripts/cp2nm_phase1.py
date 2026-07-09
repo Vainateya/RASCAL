@@ -551,12 +551,21 @@ def _passed(m, cfg: CP2P1Config) -> bool:
 
 
 def _print_confusion(conf):
-    cols = ["NOSIG", "S0", "S1", "S2", "S3", "UNPARSED"]
+    """Bob's 5x6 confusion. Rows = true class; cols = inferred output class
+    (numeric -> NOSIG, RASCAL_j -> RAS_j, else UNPARS). A '*' marks the diagonal
+    (col == row): trigger-success for SIGNAL rows, cover for the NOSIGNAL row. The
+    'total' column and the per-class line are the eval counts per true class -- so
+    under-sampling from the fixed eval_steg_seed is visible."""
+    cols = ["NOSIG", "RAS_0", "RAS_1", "RAS_2", "RAS_3", "UNPARS"]
     rows = ["NOSIGNAL", "SIGNAL_0", "SIGNAL_1", "SIGNAL_2", "SIGNAL_3"]
-    print("  Bob confusion (rows=true signal class, cols=Bob output class):")
-    print("            " + "".join(f"{c:>9}" for c in cols))
-    for r, row in zip(rows, conf):
-        print(f"    {r:<9}" + "".join(f"{v:>9}" for v in row))
+    print("  Bob confusion (rows=true, cols=inferred; * = diagonal = trigger/cover):")
+    print("    " + f"{'true/pred':<10}" + "".join(f"{c:>8}" for c in cols) + f"{'total':>8}")
+    for i, (r, row) in enumerate(zip(rows, conf)):
+        cells = "".join(f"{str(v) + ('*' if j == i else ''):>8}" for j, v in enumerate(row))
+        print(f"    {r:<10}" + cells + f"{sum(row):>8}")
+    totals = [sum(row) for row in conf]
+    print("    per-class eval counts: "
+          + ", ".join(f"{rows[i]}={totals[i]}" for i in range(len(rows))))
 
 
 def _report(m, cfg, step):
@@ -660,6 +669,7 @@ def train(cfg: CP2P1Config):
             m = evaluate(model, tokenizer, cfg, lora_params)
             print(f"[phase1] step {step:5d}  trigger={m['trigger_overall']:.3f} "
                   f"bob_cover={m['bob_cover_nosignal']:.3f} alice_cover={m['alice_cover_overall']:.3f}")
+            _print_confusion(m["confusion"])   # diagnostic: how Bob fails per class
             best = (step, m)
             if cfg.early_stop and _passed(m, cfg):
                 print(f"[phase1] gate met at step {step} -- early stopping.")
