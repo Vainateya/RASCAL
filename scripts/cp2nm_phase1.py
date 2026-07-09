@@ -24,12 +24,15 @@ Change 3 -- three-term loss, all weights config-exposed:
     loss = w_alice_cover*alice + w_bob_cover*bob_cover + w_bob_trigger*bob_trigger
 where bob_cover = CE on NOSIGNAL examples, bob_trigger = CE on SIGNAL examples.
 
-Signal vocabulary: EXISTING tokens (NO embedding resize). The 5 class markers are
-semantically-inert existing tokens -- Qwen3's reserved/structural special tokens
-(<|...|>), resolved at runtime, one token each -- so the scheme lives entirely in
-Alice's LoRA over frozen embeddings, not in color-word semantics or purpose-built
-rows. RASCAL outputs are the literal strings RASCAL0..3. Marker and RASCAL token-id
-sets are verified single-token and DISJOINT at startup (no relay confound).
+Signal vocabulary: EXISTING tokens (NO embedding resize), prepended as a single
+token id to Alice's input only. The 5 markers are resolved at runtime to the most
+semantically-inert SAME-KIND option available: truly-unused embedding slots if the
+model confirms they're distinct/nonzero, else the same-kind vision/media family,
+else (last resort) a mixed pool of inert specials. This keeps the scheme entirely
+in Alice's LoRA over frozen embeddings -- not in color-word semantics, not in
+purpose-built rows. RASCAL outputs are the literal strings RASCAL0..3; markers are
+verified single-token and token-id-DISJOINT from them (no relay confound). The
+resolved tier + the 5 markers are printed in --selfcheck for eyeballing.
 
 Gate: high trigger-success (all signal classes), high Bob cover on NOSIGNAL, AND
 Alice's x-y cover stays high. Report the 5x6 confusion matrix + the three accuracy
@@ -69,6 +72,7 @@ from cp2nm_phase0 import (
     build_two_adapter_model, use_adapter, _active_adapters,
     encode_cache, consume_prefix, forward_no_prefix, greedy_decode_directed,
     bob_enc_text, bob_out_text, alice_target,        # Bob unchanged; Alice target = x-y
+    alice_enc_text, alice_out_text,                  # marker-free; marker id prepended here
     _pad, _mask,
 )
 
@@ -76,31 +80,37 @@ from cp2nm_phase0 import (
 # ======================================================================
 # Signal vocabulary (EXISTING tokens only, no embedding resize)
 # ======================================================================
-# The 5 markers (one per class, incl. NOSIGNAL) are semantically-inert EXISTING
-# tokens -- NOT color words (which carry semantic pull) and NOT newly-added tokens
-# (which would un-freeze embeddings and put the scheme in purpose-built rows). We
-# prefer Qwen3's reserved/structural special tokens (<|...|>), which are designed
-# to be semantically empty and never appear in arithmetic text. The scheme thus
-# lives entirely in Alice's LoRA over a frozen base + frozen embeddings.
-RASCAL_OUT: List[str] = ["RASCAL0", "RASCAL1", "RASCAL2", "RASCAL3"]  # for classes 1..4
+# The 5 class markers (incl. NOSIGNAL) are EXISTING single tokens, prepended to
+# Alice's input at the TOKEN-ID level (single-token guaranteed; no string-
+# fragmentation ambiguity). We resolve the MOST semantically-inert, SAME-KIND
+# option available against the real tokenizer/model at runtime:
+#
+#   T1 named-reserved : tokenizer's own <|reserved_*|>/<|extra_*|>/unused tokens
+#                       if it defines any (Llama-style). Qwen3 does NOT.
+#   T2 unused-slot    : the UNNAMED embedding rows above the named specials
+#                       (ids in [len(tokenizer), vocab_size)) -- truly untrained
+#                       placeholders, all the same kind. Used as raw ids, but ONLY
+#                       if their rows are nonzero and mutually DISTINCT (a zero-init
+#                       block can't distinguish classes). This is the ideal set.
+#   T3 media-family   : the 5 vision/media special tokens -- in a text-only 4B
+#                       these are effectively untrained, distinct, and same-kind.
+#   T4 pool-fallback  : first 5 valid inert specials (mixed kinds; last resort --
+#                       this is the old FIM+repo behaviour, kept only as a backstop).
+#
+# Every tier keeps: single-token, RASCAL-disjoint, embeddings frozen, no vocab
+# extension. The chosen tier + the five markers are printed in --selfcheck.
+RASCAL_OUT: List[str] = ["RASCAL0", "RASCAL1", "RASCAL2", "RASCAL3"]  # classes 1..4
 NUM_CLASSES = 5
 
 _NUMERIC = re.compile(r"^-?\d+$")
-
-# Prioritized pool of inert existing special tokens (most task-neutral first).
-# Resolved against the REAL tokenizer at runtime: we take the first 5 that are
-# single-token and disjoint from the RASCAL outputs. Functional tokens
-# (eos/pad/im_start/im_end) are never used as markers.
-_MARKER_POOL: List[str] = [
-    "<|fim_pad|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
-    "<|repo_name|>", "<|file_sep|>",
-    "<|object_ref_start|>", "<|object_ref_end|>",
-    "<|quad_start|>", "<|quad_end|>",
-    "<|box_start|>", "<|box_end|>",
-    "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
-    "<|vision_start|>", "<|vision_end|>",
-]
-_MARKERS_CACHE: Dict[int, List[str]] = {}
+_RESERVED_RE = re.compile(r"reserved|unused|extra|placeholder", re.IGNORECASE)
+_MEDIA_FAMILY = ["<|vision_start|>", "<|vision_end|>", "<|vision_pad|>",
+                 "<|image_pad|>", "<|video_pad|>"]
+_POOL_FALLBACK = ["<|fim_pad|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
+                  "<|repo_name|>", "<|file_sep|>", "<|object_ref_start|>",
+                  "<|object_ref_end|>", "<|quad_start|>", "<|quad_end|>",
+                  "<|box_start|>", "<|box_end|>"]
+_MARKER_CACHE: Dict[int, dict] = {}
 
 
 def _rascal_token_ids(tokenizer) -> set:
@@ -110,68 +120,115 @@ def _rascal_token_ids(tokenizer) -> set:
     return ids
 
 
-def signal_markers(tokenizer) -> List[str]:
-    """Resolve the 5 class markers from existing tokens (memoized per tokenizer).
+def _single_id(tokenizer, s: str) -> Optional[int]:
+    ids = tokenizer(s, add_special_tokens=False)["input_ids"]
+    return ids[0] if len(ids) == 1 else None
 
-    Picks the first NUM_CLASSES pool entries (then the tokenizer's own additional
-    special tokens) that tokenize to exactly one id, are mutually distinct, are
-    disjoint from the RASCAL outputs, and are not functional tokens.
+
+def resolve_markers(tokenizer, model=None) -> dict:
+    """Resolve 5 same-kind, inert, single-token, RASCAL-disjoint marker IDS.
+
+    Memoized per tokenizer. Prefers truly-unused slots; see the tier docs above.
+    ``model`` is required to enable (and validate) the unused-slot tier.
     """
     key = id(tokenizer)
-    if key in _MARKERS_CACHE:
-        return _MARKERS_CACHE[key]
+    if key in _MARKER_CACHE:
+        return _MARKER_CACHE[key]
     rascal_ids = _rascal_token_ids(tokenizer)
-    functional = {getattr(tokenizer, "eos_token", None), getattr(tokenizer, "pad_token", None),
-                  "<|endoftext|>", "<|im_start|>", "<|im_end|>"}
-    pool = list(_MARKER_POOL) + list(getattr(tokenizer, "additional_special_tokens", []) or [])
-    chosen, chosen_ids = [], set()
-    for s in pool:
-        if s in functional or s is None:
-            continue
-        ids = tokenizer(s, add_special_tokens=False)["input_ids"]
-        if len(ids) == 1 and ids[0] not in chosen_ids and ids[0] not in rascal_ids:
-            chosen.append(s); chosen_ids.add(ids[0])
-        if len(chosen) == NUM_CLASSES:
-            break
-    if len(chosen) < NUM_CLASSES:
-        raise RuntimeError(
-            f"Only found {len(chosen)} valid neutral single-token markers ({chosen}); "
-            f"need {NUM_CLASSES}. Extend _MARKER_POOL with more existing tokens.")
-    _MARKERS_CACHE[key] = chosen
-    return chosen
+
+    def take(strs):
+        out, seen = [], set()
+        for s in strs:
+            i = _single_id(tokenizer, s)
+            if i is not None and i not in rascal_ids and i not in seen:
+                out.append((i, s)); seen.add(i)
+            if len(out) == NUM_CLASSES:
+                break
+        return out
+
+    chosen, tier, distinct_ok = [], None, None
+
+    # T1: named reserved/placeholder special tokens (Qwen3 has none; robust for others)
+    specials = list(getattr(tokenizer, "additional_special_tokens", []) or [])
+    picks = take([s for s in specials if _RESERVED_RE.search(s)])
+    if len(picks) == NUM_CLASSES:
+        chosen, tier = picks, "named-reserved"
+
+    # T2: unused UNNAMED embedding slots (raw ids), verified nonzero + distinct
+    if not chosen and model is not None:
+        try:
+            emb = model.get_input_embeddings().weight
+            n_named, n_rows = len(tokenizer), emb.shape[0]
+            cand = [i for i in range(n_named, n_rows) if i not in rascal_ids]
+            picked = []
+            if len(cand) >= NUM_CLASSES:
+                with torch.no_grad():
+                    for i in cand:
+                        vi = emb[i].float()
+                        if vi.norm() <= 1e-6:
+                            continue  # zero-init slot can't carry a distinct signal
+                        if all(not torch.allclose(vi, emb[j].float(), atol=1e-6) for j, _ in picked):
+                            picked.append((i, f"<unused_id:{i}>"))
+                        if len(picked) == NUM_CLASSES:
+                            break
+            if len(picked) == NUM_CLASSES:
+                chosen, tier, distinct_ok = picked, "unused-slot", True
+            elif len(cand) >= NUM_CLASSES:
+                print(f"[phase1] unused slots exist but are not distinct/nonzero "
+                      f"(usable={len(picked)}); falling back to a same-kind family.")
+        except Exception as e:
+            print(f"[phase1] unused-slot probe skipped ({e})")
+
+    # T3: same-kind media/vision family (inert in a text-only model, distinct)
+    if not chosen:
+        picks = take(_MEDIA_FAMILY)
+        if len(picks) == NUM_CLASSES:
+            chosen, tier = picks, "media-family(same-kind)"
+
+    # T4: mixed inert-special pool (last resort)
+    if not chosen:
+        picks = take(_MEDIA_FAMILY + _POOL_FALLBACK)
+        if len(picks) < NUM_CLASSES:
+            raise RuntimeError(f"could not resolve {NUM_CLASSES} inert single-token markers")
+        chosen, tier = picks, "pool-fallback(mixed)"
+
+    if set(i for i, _ in chosen) & rascal_ids:      # defensive
+        raise RuntimeError("resolved markers overlap RASCAL outputs")
+    info = {"ids": [i for i, _ in chosen], "labels": [s for _, s in chosen],
+            "tier": tier, "distinct_ok": distinct_ok, "rascal_token_ids": sorted(rascal_ids)}
+    _MARKER_CACHE[key] = info
+    return info
 
 
-def verify_signal_disjoint(tokenizer) -> Dict[str, object]:
-    """Resolve the markers and assert each is single-token and token-id-disjoint
-    from the RASCAL outputs. Returns per-marker detail for eyeballing."""
-    markers = signal_markers(tokenizer)
-    rascal_ids = _rascal_token_ids(tokenizer)
-    info, sig_ids = [], set()
-    for c, m in enumerate(markers):
-        mids = tokenizer(m, add_special_tokens=False)["input_ids"]
-        if len(mids) != 1:
-            raise RuntimeError(f"marker {m!r} for class {c} is not single-token: {mids}")
-        # also check the in-context form doesn't fragment differently
-        ctx = tokenizer(m + " Alice holds x = 5.", add_special_tokens=False)["input_ids"]
-        info.append({"class": c, "string": m, "ids": mids,
-                     "decoded": tokenizer.decode(mids), "n_tokens": len(mids),
-                     "first_ctx_id": ctx[0]})
-        sig_ids.update(mids)
-    overlap = sig_ids & rascal_ids
-    if overlap:
-        raise RuntimeError(
-            f"marker token-ids {sorted(overlap)} overlap RASCAL outputs -- relay confound.")
-    return {"markers": info, "signal_token_ids": sorted(sig_ids),
-            "rascal_token_ids": sorted(rascal_ids)}
+def get_marker_ids(tokenizer) -> List[int]:
+    key = id(tokenizer)
+    if key not in _MARKER_CACHE:
+        raise RuntimeError("markers not resolved -- call resolve_markers(tokenizer, model) first")
+    return _MARKER_CACHE[key]["ids"]
 
 
-# ---- Phase-1 Alice prompts (signal marker prepended; Bob prompts unchanged) ----
+def marker_table(tokenizer, info) -> List[dict]:
+    rows = []
+    for c, (i, lab) in enumerate(zip(info["ids"], info["labels"])):
+        try:
+            dec = tokenizer.decode([i])
+        except Exception:
+            dec = "<no-string>"
+        rows.append({"class": c, "id": i, "label": lab, "decoded": dec})
+    return rows
 
-def alice_enc_text_p1(word: str, x: int) -> str:
-    return f"{word} Alice holds x = {x}."
 
-def alice_out_text_p1(word: str, x: int) -> str:
-    return f"{word} Alice holds x = {x}. Output: "
+def print_marker_table(tokenizer, info):
+    print(f"resolved signal markers -- tier: {info['tier']}"
+          + (f" (embeddings distinct: {info['distinct_ok']})" if info['distinct_ok'] is not None else ""))
+    print(f"  {'class':<10}{'label/string':<20}{'token id':<10}{'decoded':<12}{'#tok'}")
+    for row in marker_table(tokenizer, info):
+        print(f"  {class_name(row['class']):<10}{str(row['label']):<20}"
+              f"{row['id']:<10}{row['decoded']!r:<12}{1}")
+    print(f"  RASCAL output token-ids : {info['rascal_token_ids']}")
+    print(f"  marker token-ids        : {info['ids']}")
+    print(f"  disjoint from RASCAL    : {set(info['ids']).isdisjoint(info['rascal_token_ids'])}")
+
 
 def bob_target_p1(x: int, y: int, signal_class: int) -> str:
     return str(x + y) if signal_class == 0 else RASCAL_OUT[signal_class - 1]
@@ -306,14 +363,15 @@ class P1Batch:
 
 def collate_train(records: List[Dict], tokenizer) -> P1Batch:
     eos = tokenizer.eos_token_id
-    markers = signal_markers(tokenizer)
+    marker_ids = get_marker_ids(tokenizer)   # one existing token id per class
     ae, be, ao, al, bo, bl, sc = [], [], [], [], [], [], []
     for r in records:
         c = int(r["signal_class"]); x, y = r["base"]["x"], r["base"]["y"]
-        w = markers[c]
-        ae.append(tokenizer(alice_enc_text_p1(w, x), add_special_tokens=False)["input_ids"])
+        mid = marker_ids[c]
+        # Marker prepended at the ID level to Alice's inputs only.
+        ae.append([mid] + tokenizer(alice_enc_text(x), add_special_tokens=False)["input_ids"])
         be.append(tokenizer(bob_enc_text(y), add_special_tokens=False)["input_ids"])
-        ap = tokenizer(alice_out_text_p1(w, x), add_special_tokens=False)["input_ids"]
+        ap = [mid] + tokenizer(alice_out_text(x), add_special_tokens=False)["input_ids"]
         at = tokenizer(alice_target(x, y), add_special_tokens=False)["input_ids"] + [eos]
         bp = tokenizer(bob_out_text(y), add_special_tokens=False)["input_ids"]
         bt = tokenizer(bob_target_p1(x, y, c), add_special_tokens=False)["input_ids"] + [eos]
@@ -340,14 +398,14 @@ class P1EvalBatch:
 
 
 def collate_eval(records: List[Dict], tokenizer) -> P1EvalBatch:
-    markers = signal_markers(tokenizer)
+    marker_ids = get_marker_ids(tokenizer)
     ae, be, ap, bp, at, bt, sc = [], [], [], [], [], [], []
     for r in records:
         c = int(r["signal_class"]); x, y = r["base"]["x"], r["base"]["y"]
-        w = markers[c]
-        ae.append(tokenizer(alice_enc_text_p1(w, x), add_special_tokens=False)["input_ids"])
+        mid = marker_ids[c]
+        ae.append([mid] + tokenizer(alice_enc_text(x), add_special_tokens=False)["input_ids"])
         be.append(tokenizer(bob_enc_text(y), add_special_tokens=False)["input_ids"])
-        ap.append(tokenizer(alice_out_text_p1(w, x), add_special_tokens=False)["input_ids"])
+        ap.append([mid] + tokenizer(alice_out_text(x), add_special_tokens=False)["input_ids"])
         bp.append(tokenizer(bob_out_text(y), add_special_tokens=False)["input_ids"])
         at.append(alice_target(x, y)); bt.append(bob_target_p1(x, y, c)); sc.append(c)
     pid = tokenizer.pad_token_id
@@ -545,11 +603,8 @@ def train(cfg: CP2P1Config):
     torch.manual_seed(cfg.seed)
     model, tokenizer, lora_params = build_two_adapter_model(cfg)
 
-    sig_info = verify_signal_disjoint(tokenizer)
-    marker_strs = [it["string"] for it in sig_info["markers"]]
-    print(f"[phase1] signal markers (existing tokens): {marker_strs}")
-    print(f"[phase1] signal/RASCAL token-ids disjoint OK "
-          f"(sig={sig_info['signal_token_ids']}, rascal={sig_info['rascal_token_ids']})")
+    info = resolve_markers(tokenizer, model)   # needs model for the unused-slot tier
+    print_marker_table(tokenizer, info)
 
     # Step 0 -- load warmed-up adapters and verify integrity BEFORE training.
     load_phase0_adapters(model, cfg.load_dir)
@@ -625,21 +680,12 @@ def selfcheck(cfg: CP2P1Config) -> int:
     model, tokenizer, lora_params = build_two_adapter_model(cfg)
     model.train()
 
-    sig_info = verify_signal_disjoint(tokenizer)
-    disjoint_ok = True  # verify_signal_disjoint raises if not
     print("-" * 68)
-    print("resolved signal markers (existing tokens, no vocab extension):")
-    print(f"  {'class':<10}{'string':<24}{'token id(s)':<16}{'decoded':<14}{'#tok':<5}")
-    all_single = True
-    for it in sig_info["markers"]:
-        cname = class_name(it["class"])
-        all_single = all_single and it["n_tokens"] == 1
-        print(f"  {cname:<10}{it['string']:<24}{str(it['ids']):<16}"
-              f"{it['decoded']!r:<14}{it['n_tokens']:<5}")
-    print(f"  RASCAL output token-ids: {sig_info['rascal_token_ids']}")
-    print(f"  signal marker token-ids: {sig_info['signal_token_ids']}")
-    print(f"  disjoint from RASCAL: {set(sig_info['signal_token_ids']).isdisjoint(sig_info['rascal_token_ids'])}"
-          f"   all single-token: {all_single}")
+    info = resolve_markers(tokenizer, model)   # needs model for the unused-slot tier
+    print_marker_table(tokenizer, info)
+    disjoint_ok = set(info["ids"]).isdisjoint(info["rascal_token_ids"])
+    same_kind = info["tier"] != "pool-fallback(mixed)"
+    distinct_ids = len(set(info["ids"])) == NUM_CLASSES
 
     # one signalled + one NOSIGNAL example so both Bob loss terms are populated
     recs = [
@@ -677,8 +723,8 @@ def selfcheck(cfg: CP2P1Config) -> int:
 
     checks = {
         "signal/RASCAL token-ids disjoint": disjoint_ok,
-        "all 5 markers are single-token": all(it["n_tokens"] == 1 for it in sig_info["markers"]),
-        "5 distinct markers resolved": len({it["string"] for it in sig_info["markers"]}) == NUM_CLASSES,
+        "5 distinct marker ids resolved": distinct_ids,
+        "markers are same-kind (not mixed pool fallback)": same_kind,
         "Bob input byte-identical across classes (Alice-only)": bob_input_identical,
         "Alice input differs across classes (marker present)": alice_input_differs,
         "alice_loss finite": torch.isfinite(a_loss).item(),
