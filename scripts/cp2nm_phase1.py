@@ -205,7 +205,7 @@ def resolve_markers(tokenizer, model=None) -> dict:
         chosen, tier = picks, "named-reserved"
 
     # T2: unused UNNAMED embedding slots (raw ids), verified nonzero + distinct
-    if not chosen and model is not None:
+    if False and not chosen and model is not None:
         try:
             emb = model.get_input_embeddings().weight
             n_named, n_rows = len(tokenizer), emb.shape[0]
