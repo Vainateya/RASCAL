@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv)",
+      "Read(//usr/bin/**)",
+      "Read(//workspace/**)",
+      "Bash(kill -0 14714)",
+      "Bash(awk 'NR%4==0')",
+      "Bash(kill -0 20791)",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\('/dev/stdin'\\)\\); print\\('config WD=', d\\)\")",
+      "Bash(cat)",
+      "Bash(chmod +x /workspace/logs/grokwatch.sh)",
+      "Bash(nohup bash /workspace/logs/grokwatch.sh /workspace/logs/stripped_4c_run1_wd05.log 20791 0.40 350)",
+      "Bash(echo \"watcher PID $!\")",
+      "Bash(awk 'NR==353 || NR==354 || NR==355 || NR==463 || NR==464 || NR==465' scripts/coadv_train.py)"
+    ]
+  }
+}
