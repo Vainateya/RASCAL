@@ -12,7 +12,8 @@
       "Bash(chmod +x /workspace/logs/grokwatch.sh)",
       "Bash(nohup bash /workspace/logs/grokwatch.sh /workspace/logs/stripped_4c_run1_wd05.log 20791 0.40 350)",
       "Bash(echo \"watcher PID $!\")",
-      "Bash(awk 'NR==353 || NR==354 || NR==355 || NR==463 || NR==464 || NR==465' scripts/coadv_train.py)"
+      "Bash(awk 'NR==353 || NR==354 || NR==355 || NR==463 || NR==464 || NR==465' scripts/coadv_train.py)",
+      "Bash(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv)"
     ]
   }
 }

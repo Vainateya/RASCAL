@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import os
 import re
 import sys
@@ -70,6 +71,7 @@ from rascal.data import (
     SplitArithmeticStream, SplitArithmeticDataset,
     SteganographicStream, SteganographicDataset, class_name,
 )
+from rascal.data.steg_dataset import StegConfig, NUM_SIGNAL_CLASSES
 
 # Reuse Phase 0 / CP1 machinery UNCHANGED.
 import cp2nm_phase0 as p0
@@ -316,6 +318,13 @@ class CP2P1Config:
     w_bob_cover: float = 1.0      # Bob x+y on NOSIGNAL
     w_bob_trigger: float = 1.0    # Bob single-token signal word on SIGNAL_i
 
+    # Number of signal classes actually USED (NOSIGNAL + (n-1) SIGNAL classes).
+    # Default 5 = the original 5-class scheme (untouched). Set --classes 2 for the
+    # binary run: NOSIGNAL + one SIGNAL, the reachable difficulty per the stripped
+    # test (N=2 groks; N=4 is stuck in the constant-output attractor). Markers and
+    # outputs still resolve from the full pool; only the first n_classes are used.
+    n_classes: int = 5
+
     lr: float = 1e-4
     weight_decay: float = 0.0
     batch_size: int = 16
@@ -349,6 +358,31 @@ class CP2P1Config:
     save_dir: str = os.path.join(_HERE, os.pardir, "checkpoints", "cp2nm_phase1")
     seed: int = 0
     device: str = "cuda"
+
+    def trigger_floor(self) -> float:
+        """Signal-blind entropy floor of the bob_trigger CE (the grok reference).
+
+        Bob's SIGNAL target is two positions: [signal word, EOS]. A signal-blind Bob
+        faces a ~50/50 switch-vs-don't-switch choice on the first position (the cover
+        continuation vs the signal word) -> ~ln2 there, and is confident on EOS -> ~0.
+        Averaged over the two positions, the floor is ~ln(2)/2 = 0.347. bt durably
+        BELOW this floor is the true transmission signal; trigger ACCURACY flickers
+        above it via argmax on tied logits and must NOT be trusted as convergence.
+        (Exact value is for the binary case; used as the reference line for --classes 2.)"""
+        return math.log(2) / 2
+
+
+def _steg_config(cfg: CP2P1Config) -> StegConfig:
+    """Steg class weights for the USED cardinality: 50% NOSIGNAL, the other 50%
+    split evenly across the (n_classes-1) SIGNAL classes, zero on the rest. For
+    n_classes=5 this reproduces the default weights exactly; for n_classes=2 it is
+    the binary channel [0.5, 0.5, 0, 0, 0] -- only NOSIGNAL and SIGNAL_0 ever fire."""
+    w = [0.0] * NUM_SIGNAL_CLASSES
+    w[0] = 0.5
+    n_sig = cfg.n_classes - 1
+    for c in range(1, cfg.n_classes):
+        w[c] = 0.5 / n_sig
+    return StegConfig(class_weights=w)
 
 
 # ======================================================================
@@ -537,11 +571,11 @@ def _classify_bob(text: str, outputs: List[str]) -> int:
 @torch.no_grad()
 def evaluate(model, tokenizer, cfg: CP2P1Config, lora_params) -> Dict[str, object]:
     base_eval = SplitArithmeticDataset(cfg.eval_size, cfg.min_digits, cfg.max_digits, seed=12345)
-    ev = SteganographicDataset(base_eval, seed=cfg.eval_steg_seed)
+    ev = SteganographicDataset(base_eval, config=_steg_config(cfg), seed=cfg.eval_steg_seed)
     outputs = output_tokens(tokenizer)
     model.eval()
 
-    confusion = [[0] * 6 for _ in range(NUM_CLASSES)]   # rows: true class; cols: 0..4 + UNPARSED
+    confusion = [[0] * 6 for _ in range(cfg.n_classes)]  # rows: true class; cols: 0..4 + UNPARSED
     trig_ok = [0] * NUM_CLASSES; trig_tot = [0] * NUM_CLASSES
     cover_ok = cover_tot = 0
     a_ok = a_tot = a_ok_ns = a_tot_ns = a_ok_sig = a_tot_sig = 0
@@ -591,8 +625,8 @@ def evaluate(model, tokenizer, cfg: CP2P1Config, lora_params) -> Dict[str, objec
     model.train()
 
     trig_per = {class_name(c): (trig_ok[c] / trig_tot[c] if trig_tot[c] else 0.0)
-                for c in range(1, NUM_CLASSES)}
-    n_sig = sum(trig_tot[1:]); n_sig_ok = sum(trig_ok[1:])
+                for c in range(1, cfg.n_classes)}
+    n_sig = sum(trig_tot[1:cfg.n_classes]); n_sig_ok = sum(trig_ok[1:cfg.n_classes])
     return {
         "confusion": confusion,
         "output_tokens": outputs,   # column labels for the SIGNAL classes
@@ -623,7 +657,7 @@ def _print_confusion(conf, out_labels=None):
     true class -- so under-sampling from the fixed eval_steg_seed is visible."""
     outs = out_labels if out_labels is not None else ["S0", "S1", "S2", "S3"]
     cols = ["NOSIG"] + [o[:6] for o in outs] + ["UNPARS"]
-    rows = ["NOSIGNAL", "SIGNAL_0", "SIGNAL_1", "SIGNAL_2", "SIGNAL_3"]
+    rows = [class_name(i) for i in range(len(conf))]   # dynamic: n_classes rows
     print("  Bob confusion (rows=true, cols=inferred; * = diagonal = trigger/cover):")
     print("    " + f"{'true/pred':<10}" + "".join(f"{c:>8}" for c in cols) + f"{'total':>8}")
     for i, (r, row) in enumerate(zip(rows, conf)):
@@ -689,6 +723,21 @@ def train(cfg: CP2P1Config):
               "Fix the load path before training.")
         return 2
 
+    # Cover-collapse baseline: the Phase 0 Bob NOSIGNAL cover. If adding the signal
+    # objective craters this early, the signal term is knocking the pair out of the
+    # Phase 0 basin -- flag it (the fix is anchoring cover via w_bob_cover, not more
+    # signal). This is the cover-vs-signal analog of the stripped sharp-minimum collapse.
+    phase0_bob_cover = None
+    _summ = os.path.join(cfg.load_dir, "phase0_summary.json")
+    if os.path.exists(_summ):
+        phase0_bob_cover = json.load(open(_summ)).get("metrics", {}).get("bob_cover")
+    floor = cfg.trigger_floor()
+    print(f"[phase1] n_classes={cfg.n_classes} | bob_trigger signal-blind floor ~= {floor:.3f} "
+          f"-- watch bt LEAVE this floor (trigger accuracy lies on the plateau).")
+    if phase0_bob_cover is not None:
+        print(f"[phase1] Phase 0 Bob cover baseline = {phase0_bob_cover:.3f} "
+              f"(cover-collapse guard trips on a sharp early drop).")
+
     if cfg.grad_checkpointing:
         model.gradient_checkpointing_enable()
         print("[phase1] gradient checkpointing ENABLED (via config)")
@@ -698,11 +747,36 @@ def train(cfg: CP2P1Config):
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, s / max(1, cfg.warmup_steps)))
 
     base_stream = SplitArithmeticStream(cfg.min_digits, cfg.max_digits, seed=cfg.seed)
-    stream = SteganographicStream(base_stream, seed=cfg.seed)
+    stream = SteganographicStream(base_stream, config=_steg_config(cfg), seed=cfg.seed)
     it = iter(stream)
 
     print(f"[phase1] loss weights: alice_cover={cfg.w_alice_cover} "
           f"bob_cover={cfg.w_bob_cover} bob_trigger={cfg.w_bob_trigger}")
+
+    # Step-0 bt calibration probe (no-grad, no optimizer step, weights untouched).
+    # The freshly-loaded Phase-0 Bob is signal-NAIVE (never saw a signal target), so
+    # this bt is expected HIGH (~ -log P(signal word) >> floor), NOT ~0.347. That is
+    # healthy: it just confirms the warm start carries no signal. The floor formula
+    # describes a PRIOR-FITTED signal-blind Bob; the real calibration check is that
+    # bt DESCENDS to ~floor within the first ~200 steps (watched in the eval prints
+    # below), not that it starts there.
+    with torch.no_grad():
+        _bt_samples = []
+        for _ in range(4):
+            _recs = list(itertools.islice(it, cfg.batch_size))
+            _b = collate_train(_recs, tokenizer).to(cfg.device)
+            _, _, _bt0 = barrier_forward_p1(model, _b, lora_params)
+            _bt_samples.append(_bt0.item())
+        _bt0_mean = sum(_bt_samples) / len(_bt_samples)
+    print(f"[phase1] STEP-0 bt (signal-naive, no training) = {_bt0_mean:.4f} "
+          f"over {len(_bt_samples)} batches | floor~={floor:.3f}")
+    print(f"[phase1]   expect HIGH here (warm start is signal-naive); calibration gate "
+          f"is bt DESCENDING to ~{floor:.3f} within ~200 steps, not starting there.")
+    # Re-seed the stream so training sees the same sequence as an un-probed run
+    # (the 4 probe batches above advanced `it`).
+    it = iter(SteganographicStream(
+        SplitArithmeticStream(cfg.min_digits, cfg.max_digits, seed=cfg.seed),
+        config=_steg_config(cfg), seed=cfg.seed))
 
     best = None
     for step in range(1, cfg.max_steps + 1):
@@ -730,18 +804,42 @@ def train(cfg: CP2P1Config):
         opt.step(); sched.step()
 
         if step % 25 == 0:
+            bt = bt_loss.item()
             print(f"[phase1] step {step:5d}  loss {tot:.4f} "
-                  f"(a={a_loss.item():.3f} bc={bc_loss.item():.3f} bt={bt_loss.item():.3f})")
-        if step % cfg.eval_every == 0:
+                  f"(a={a_loss.item():.3f} bc={bc_loss.item():.3f} "
+                  f"bt={bt:.3f} {'BELOW' if bt < floor else 'at/above'} floor {floor:.3f})")
+        # Early eval at step 50 too, so the cover-collapse guard sees steps 50-200.
+        if step == 50 or step % cfg.eval_every == 0:
             m = evaluate(model, tokenizer, cfg, lora_params)
+            bt = bt_loss.item()
+            left = bt < floor
             print(f"[phase1] step {step:5d}  trigger={m['trigger_overall']:.3f} "
                   f"bob_cover={m['bob_cover_nosignal']:.3f} alice_cover={m['alice_cover_overall']:.3f}")
-            _print_confusion(m["confusion"], m.get("output_tokens"))   # how Bob fails per class
+            # Loss-vs-trigger honesty: bt is the real transmission signal, not trigger acc.
+            print(f"[phase1] step {step:5d}  bt(train)={bt:.4f}  floor~={floor:.3f}  "
+                  f"-> {'LEFT the floor (real transmission forming)' if left else 'still glued to the floor'}"
+                  + ("" if left or m['trigger_overall'] < 0.5 else
+                     "  [NOTE] trigger looks high but bt has NOT left the floor -> argmax flicker, NOT transmission"))
+            # Cover-collapse guard (early steps): did the signal objective crater cover?
+            if step <= 200 and phase0_bob_cover is not None:
+                drop = phase0_bob_cover - m["bob_cover_nosignal"]
+                if drop > 0.15 or m["bob_cover_nosignal"] < 0.80:
+                    print(f"[phase1] [COVER-COLLAPSE WARNING] Bob NOSIGNAL cover "
+                          f"{m['bob_cover_nosignal']:.3f} vs Phase 0 {phase0_bob_cover:.3f} "
+                          f"(drop {drop:.3f}) -- the signal objective is knocking the pair out "
+                          f"of the Phase 0 basin. Fix = anchor cover with w_bob_cover, NOT more signal.")
+            _report(m, cfg, step)   # full disaggregated report: covers, per-class trigger, ablations, confusion
             best = (step, m)
-            if cfg.early_stop and _passed(m, cfg):
-                print(f"[phase1] gate met at step {step} -- early stopping.")
+            # Transmission-honest early stop: require bt below the floor, so a trigger-
+            # accuracy flicker on tied logits cannot trip the gate on its own.
+            if cfg.early_stop and _passed(m, cfg) and left:
+                print(f"[phase1] gate met at step {step} (trigger + covers pass AND bt below floor) "
+                      f"-- early stopping.")
                 save_checkpoint(model, tokenizer, cfg, m, step); _report(m, cfg, step)
                 return 0
+            if cfg.early_stop and _passed(m, cfg) and not left:
+                print(f"[phase1] trigger+covers pass but bt={bt:.3f} still at/above floor "
+                      f"{floor:.3f} -- NOT stopping (likely argmax flicker, not real transmission).")
 
     step, m = best if best else (cfg.max_steps, evaluate(model, tokenizer, cfg, lora_params))
     save_checkpoint(model, tokenizer, cfg, m, step); _report(m, cfg, step)
@@ -845,17 +943,29 @@ def main():
     ap.add_argument("--w-alice-cover", type=float, default=None)
     ap.add_argument("--w-bob-cover", type=float, default=None)
     ap.add_argument("--w-bob-trigger", type=float, default=None)
+    ap.add_argument("--classes", type=int, default=None, choices=[2, 3, 4, 5],
+                    help="number of signal classes used (NOSIGNAL + n-1 SIGNAL). "
+                         "Default 5 (original scheme); 2 = the binary channel.")
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--weight-decay", type=float, default=None)
     args = ap.parse_args()
 
     cfg = CP2P1Config()
+    if args.classes is not None: cfg.n_classes = args.classes
     if args.load_dir: cfg.load_dir = args.load_dir
-    if args.save_dir: cfg.save_dir = args.save_dir
+    # Per-N default save dir so the binary run never clobbers the 5-class checkpoint.
+    if args.save_dir:
+        cfg.save_dir = args.save_dir
+    elif cfg.n_classes != 5:
+        cfg.save_dir = os.path.join(_HERE, os.pardir, "checkpoints", f"cp2nm_phase1_{cfg.n_classes}c")
     if args.model: cfg.model_id = args.model
     if args.device: cfg.device = args.device
     if args.steps: cfg.max_steps = args.steps
     if args.batch_size: cfg.batch_size = args.batch_size
     if args.grad_accum: cfg.grad_accum = args.grad_accum
     if args.grad_checkpointing: cfg.grad_checkpointing = True
+    if args.lr is not None: cfg.lr = args.lr
+    if args.weight_decay is not None: cfg.weight_decay = args.weight_decay
     if args.w_alice_cover is not None: cfg.w_alice_cover = args.w_alice_cover
     if args.w_bob_cover is not None: cfg.w_bob_cover = args.w_bob_cover
     if args.w_bob_trigger is not None: cfg.w_bob_trigger = args.w_bob_trigger
